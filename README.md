@@ -18,5 +18,5 @@ An advanced, Python-based **Authorized Network Monitoring and Security Auditing 
 
 1. Clone the repository:
    bash
-   git clone https://github.com/hhsanjeewani-tech/net-sentinel-framework.git(https://github.com/hhsanjeewani-tech/net-sentinel-framework.git)
-   cd net-sentinel-framework
+   https://github.com/hhsanjeewani-tech/Net-sentinel-framework.git
+   cd Net-sentinel-framework
